@@ -1,0 +1,8 @@
+model {
+  for (i in 1:N) {
+    y[i] ~ dbern(p[i])
+    p[i] <- pow(ske[d[i]], exp(theta))
+
+  }
+  theta ~ dnorm(0,0.5)
+}
