@@ -17,18 +17,21 @@ estimate_MTD_prior <- function(skeleton, TARGET=0.3, cutoff=0.96,
 }
 # build the "temporary dataset" at time t_now (evaluated only)
 build_temp_rows <- function(patient_df, t_now, window) {
+  
+  # only administrations that already occurred
   tmp <- patient_df[patient_df$arrival_time <= t_now, , drop=FALSE]
   
-  # observed DLT by time t_now
+  # 1) has the DLT already been observed?
   tmp$y_obs <- as.integer(tmp$DLT_time <= t_now)
   
-  # follow-up fraction for TITE (clamped to [0,1])
-  # tmp$weight <- pmin(1, pmax(0, (t_now - tmp$arrival_time) / window))
+  # 2) is the toxicity outcome now known?
+  # known if either DLT occurred OR window finished
+  tmp$complete <- as.integer(tmp$y_obs == 1L | tmp$eval_time <= t_now)
   
-  # completed follow-up by t_now
-  tmp$complete <- as.integer(tmp$eval_time <= t_now | tmp$y_obs == 1L)
+  # keep only rows whose toxicity status is known
+  tmp <- tmp[tmp$complete == 1, , drop=FALSE]
   
-  tmp
+  return(tmp)
 }
 assemble_ipde_data <- function(tmp, ordering) {
   stopifnot(all(c("y_obs","complete","dose","ipde_true") %in% names(tmp)))
@@ -167,7 +170,6 @@ estimate_MTD_JAGS <- function(y, d_level, skeleton,
     d = as.integer(d_level),
     ske = as.numeric(skeleton)
   )
-  
   jags <- rjags::jags.model(
     file   = model_file,
     data   = data_jags,
@@ -220,17 +222,15 @@ log_marginal_lik <- function(y, d, skeleton, sigma = sqrt(2),  # Falke uses Var=
   stopifnot(length(y) == length(d))
   s_i <- skeleton[d]
   if (any(s_i <= 0 | s_i >= 1, na.rm = TRUE)) stop("skeleton entries must be in (0,1).")
-  cat('y', y, '\n')
-  cat('d', d, '\n')
-  cat('ske', s_i, '\n')
   log_integrand <- function(beta) {
     
     # clamp away from 0/1 to avoid log(0)
     eps <- 1e-12
     ll <- 0
     for(i in 1:length(y)){
-      p <- pmin(1 - eps, pmax(eps, log(skeleton[d[i]]^exp(beta))))
-      ll <- ll + (y[i] * log(p))+ (1 - y[i]) * log(1-p)
+      p <- skeleton[d[i]]^exp(beta)
+      p <- pmin(1-eps, pmax(eps, p))
+      ll <- ll + y[i]*log(p) + (1-y[i])*log(1-p)
     }
     
     prior <- dnorm(beta, 0, sigma, log = TRUE)
@@ -274,6 +274,7 @@ estimate_MTD_POCRM <- function(orderings,
   posttox_order = matrix(nrow = length(orderings), ncol = ndose)
   p_overtox_order = rep(0,length(orderings))
   marginal = rep(0,length(orderings))
+  browswe
   for(i in 1:length(orderings)){
     combined = assemble_ipde_data(tmp, orderings[[i]])
     posttox = estimate_MTD_JAGS(combined$y, 
@@ -289,7 +290,7 @@ estimate_MTD_POCRM <- function(orderings,
                                 thin)
     posttox_order[i,] = posttox$posttox[combined$real_pos]
     p_overtox_order[i] = posttox$prob_overtox
-    marginal[i] = log_marginal_lik(combined$y,combined$d,skeleton, sigma = 2)
+    marginal[i] = log_marginal_lik(combined$y,combined$d,skeleton, sigma = sqrt(2))
   }
   weights = compute_model_weights(marginal)
   weighted_p <- as.numeric(t(weights) %*% posttox_order)
@@ -351,7 +352,10 @@ simulate_IPDE_trial <- function(
   t_last <- 0
   next_pid <- 0L
   j_recent <- 1L
-  j_S_prev <- 1L
+  MTD_hat <- 1L
+  tmp_last  <- patient[0, ]   # empty
+  t_mtd     <- -Inf           # time of last MTD update
+  # j_S_prev <- 1L
   #stop the trial due to overtoxicity
   trial_stop = 0
   # event loop needs next cohort arrival time. We'll generate cohort-by-cohort using your block.
@@ -405,18 +409,21 @@ simulate_IPDE_trial <- function(
                                   TARGET,
                                   cutoff)
         MTD_hat <- est$MTD
+        tmp_last <- tmp
+        MTD_hat  <- est$MTD
+        t_mtd    <- t_admin
         stop <- est$stop
         if(stop){
           trial_stop = TRUE
           break
         }
         # observe DLT by time t_now for this row
-        y_obs <- as.integer(patient$DLT_time[r] <= t_now)
+        y_obs <- as.integer(patient$DLT_time[r] <= t_admin)
         
         if (verbose) {
           cat(sprintf("[EVAL] t=%.2f pid=%d cycle=%d dose=%d y_obs=%d MTD=%d n_eval_d=%d\n",
                       t_now, pid, cyc, d_cur, y_obs, MTD_hat,
-                      evaluated_count(patient, d_cur, t_now)))
+                      evaluated_count(patient, d_cur, t_admin)))
         }
         
         # "consume" this evaluated row so we don't process it again
@@ -488,27 +495,29 @@ simulate_IPDE_trial <- function(
       }
       # -------- 4) Decide starting dose for this arriving participant --------------------------
       # build temp dataset at arrival time and estimate MTD (placeholder)
-      tmp <- build_temp_rows(patient, t_now, window)
-      est <- estimate_MTD_POCRM(ordering,
-                                tmp,
-                                skeleton,
-                                ndose,
-                                TARGET,
-                                cutoff)
-      j_MTD <- est$MTD
-      #if trial stops when new patient arrives, jump out the loop
-      if(est$stop){
-        trial_stop = 1
-        break
-      }
-      if (j_MTD > j_recent && sum(tmp$dose == j_recent & tmp$complete == 1L) >= 3L) {
+      # tmp <- build_temp_rows(patient, t_now, window)
+      # est <- estimate_MTD_POCRM(ordering,
+      #                           tmp,
+      #                           skeleton,
+      #                           ndose,
+      #                           TARGET,
+      #                           cutoff)
+      # j_MTD <- est$MTD
+      # #if trial stops when new patient arrives, jump out the loop
+      # if(est$stop){
+      #   trial_stop = 1
+      #   break
+      # }
+      n_complete_recent <- sum(tmp_last$dose == j_recent & tmp_last$complete == 1L)
+      
+      if (MTD_hat > j_recent && n_complete_recent >= 3L) {
         j_S_curr <- min(j_recent + 1L, J)
-      } else if (j_MTD > j_recent && sum(tmp$dose == j_recent & tmp$complete == 1L) < 3L) {
+      } else if (MTD_hat > j_recent && n_complete_recent < 3L) {
         j_S_curr <- j_recent
-      } else if (j_MTD < j_recent) {
+      } else if (MTD_hat < j_recent) {
         j_S_curr <- max(j_recent - 1L, 1L)
       } else {
-        j_S_curr <- j_MTD
+        j_S_curr <- MTD_hat
       }
       j_recent <- j_S_curr
       # enroll ONE participant at this arrival time (k-th in the cohort)
@@ -565,6 +574,7 @@ simulate_IPDE_trial <- function(
                               cutoff)
     if(est_final$stop){
       final_MTD = 99
+      est_final <- list(MTD=NA, posttox=rep(NA, ndose))
     }
   }
   list(
