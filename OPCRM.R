@@ -200,8 +200,8 @@ estimate_MTD_JAGS <- function(y, d_level, skeleton,
   prob_overtox <- mean(pi1_draws > TARGET)
   stop_flag <- as.integer(prob_overtox > cutoff)
   
-  cat('posttox', posttox, '\n')
-  cat('prob_overtox', prob_overtox, '\n')
+  # cat('posttox', posttox, '\n')
+  # cat('prob_overtox', prob_overtox, '\n')
   # MTD = closest to TARGET
   diff <- abs(posttox - TARGET)
   dose.best <- which(diff == min(diff))[1]
@@ -274,7 +274,6 @@ estimate_MTD_POCRM <- function(orderings,
   posttox_order = matrix(nrow = length(orderings), ncol = ndose)
   p_overtox_order = rep(0,length(orderings))
   marginal = rep(0,length(orderings))
-  browswe
   for(i in 1:length(orderings)){
     combined = assemble_ipde_data(tmp, orderings[[i]])
     posttox = estimate_MTD_JAGS(combined$y, 
@@ -339,7 +338,8 @@ simulate_IPDE_trial <- function(
     DLT_time = numeric(0),                 
     ipde_true = integer(0),
     ipde_ok = integer(0),
-    y = integer(0)              # latent truth (1 if will have DLT in this window)
+    y = integer(0),           # latent truth (1 if will have DLT in this window)
+    MTD = integer(0)                   # Current MTD level when patient enrolled
   )
   
   # participant-level state
@@ -358,6 +358,8 @@ simulate_IPDE_trial <- function(
   # j_S_prev <- 1L
   #stop the trial due to overtoxicity
   trial_stop = 0
+  #stop IPDE due to patient cap
+  stop_ipde = 0
   # event loop needs next cohort arrival time. We'll generate cohort-by-cohort using your block.
   # But evaluation events can occur between cohort arrivals, so we manage them explicitly.
   
@@ -458,7 +460,11 @@ simulate_IPDE_trial <- function(
         # -------- 3) Escalate immediately: add a NEW administration row at time t_now -----------
         new_dose <- d_cur + 1L
         new_cycle <- cyc + 1L
-        
+        # -------- 3) Escalate immediately: add a NEW administration row -----------
+        if (nrow(patient) >= Nmax) {
+          stop_ipde <- 1L
+          break
+        }
         # generate latent truth for the new administration (your mechanism)
         y_new <- rbinom(1L, 1L, PI_ipde[new_dose])
         eval_new <- t_admin + window 
@@ -476,7 +482,8 @@ simulate_IPDE_trial <- function(
             DLT_time = DLT_new,
             ipde_true = 1,
             ipde_ok = 1,
-            y = y_new
+            y = y_new,
+            MTD = MTD_hat
           )
         )
         
@@ -490,7 +497,7 @@ simulate_IPDE_trial <- function(
         }
       } # end repeat eval processing
       #if the trial stops in inner intra-patient escalation stage, jump out the loop
-      if(trial_stop){
+      if(trial_stop | stop_ipde){
         break
       }
       # -------- 4) Decide starting dose for this arriving participant --------------------------
@@ -521,6 +528,7 @@ simulate_IPDE_trial <- function(
       }
       j_recent <- j_S_curr
       # enroll ONE participant at this arrival time (k-th in the cohort)
+      if (nrow(patient) >= Nmax) {break}
       next_pid <- next_pid + 1L
       pid_new <- next_pid
       
@@ -533,7 +541,6 @@ simulate_IPDE_trial <- function(
       eval0 <- t_now + window
       DLT0 <- Inf
       if (y0 == 1L) DLT0 <- runif(1L, min = t_now, max = eval0)
-      
       new_pat <- data.frame(
         id = pid_new,
         cycle = 1L,
@@ -543,7 +550,8 @@ simulate_IPDE_trial <- function(
         DLT_time = DLT0,
         y = y0,
         ipde_true = 0,
-        ipde_ok = 1
+        ipde_ok = 1,
+        MTD = MTD_hat
       )
       patient <- rbind(patient, new_pat)
       
