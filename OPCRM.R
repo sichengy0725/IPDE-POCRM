@@ -410,6 +410,8 @@ simulate_IPDE_trial <- function(
                                   ndose,
                                   TARGET,
                                   cutoff)
+        cat('Post Tox', est$posttox, '\n')
+        cat('MTD', est$MTD, '\n')
         MTD_hat <- est$MTD
         tmp_last <- tmp
         MTD_hat  <- est$MTD
@@ -469,7 +471,7 @@ simulate_IPDE_trial <- function(
         y_new <- rbinom(1L, 1L, PI_ipde[new_dose])
         eval_new <- t_admin + window 
         DLT_new <- Inf
-        if (y_new == 1L) DLT_new <- runif(1L, t_admin, eval_new) 
+        if (y_new == 1L) DLT_new <- t_admin + sample.int(window, size = 1, replace = TRUE)
         patient$ipde_ok[r] = 0
         patient <- rbind(
           patient,
@@ -489,7 +491,7 @@ simulate_IPDE_trial <- function(
         
         current_dose[pid] <- new_dose
         current_cycle[pid] <- new_cycle
-        j_recent <- new_dose
+        # j_recent <- new_dose
         
         if (verbose) {
           cat(sprintf("      -> ESCALATE pid=%d to dose=%d (cycle=%d), new eval=%.2f\n",
@@ -540,7 +542,7 @@ simulate_IPDE_trial <- function(
       y0 <- rbinom(1L, 1L, PI[j_S_curr])
       eval0 <- t_now + window
       DLT0 <- Inf
-      if (y0 == 1L) DLT0 <- runif(1L, min = t_now, max = eval0)
+      if (y0 == 1L) DLT0 <- t_now + sample.int(window, size = 1, replace = TRUE)
       new_pat <- data.frame(
         id = pid_new,
         cycle = 1L,
