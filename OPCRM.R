@@ -567,7 +567,13 @@ simulate_IPDE_trial <- function(
     
     if (nrow(patient) >= Nmax) break
   } # end cohorts
-  t_final <- if (nrow(patient) == 0) 0 else (max(patient$arrival_time) + window)
+  if(nrow(patient) == 0){t_final = 0}
+  else{
+    t_start <- min(patient$arrival_time[patient$ipde_true == 0L])
+    t_end   <- max(patient$eval_time)
+    t_final <- t_end - t_start
+  }
+  
   if (trial_stop) {
     final_MTD = 99
     est_final <- list(MTD=NA, posttox=rep(NA, ndose))
@@ -582,6 +588,11 @@ simulate_IPDE_trial <- function(
                               ndose,
                               TARGET,
                               cutoff)
+    p_real <- est_final$posttox
+    jmax   <- max(tmp_final$dose) 
+    
+    cand   <- 1:jmax
+    final_MTD <- cand[ which.min(abs(p_real[cand] - TARGET)) ]
     if(est_final$stop){
       final_MTD = 99
       est_final <- list(MTD=NA, posttox=rep(NA, ndose))
@@ -590,7 +601,7 @@ simulate_IPDE_trial <- function(
   list(
     patient = patient,
     stop_reason = stop_reason[1:next_pid],
-    final_MTD = est_final$MTD,
+    final_MTD = final_MTD,
     posttox = est_final$posttox,
     trial_time = t_final,
     trial_stop = trial_stop
