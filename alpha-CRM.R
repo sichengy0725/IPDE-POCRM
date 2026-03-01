@@ -171,7 +171,7 @@ interp_S_vec <- function(D, d_grid, s_grid) {
   out
 }
 
-compute_Dij_alpha <- function(tmp, alpha, T) {
+compute_Dij_alpha <- function(tmp, alpha, T,  d_grid) {
   tmp <- tmp[order(tmp$id, tmp$cycle), ]
   Dij <- numeric(nrow(tmp))
   idx_by_id <- split(seq_len(nrow(tmp)), tmp$id)
@@ -182,7 +182,7 @@ compute_Dij_alpha <- function(tmp, alpha, T) {
       t_j <- sub$arrival_time[r]
       s <- 0
       for (rp in seq_len(r)) {
-        s <- s + sub$dose[rp] * alpha^((t_j - sub$arrival_time[rp]) / T)
+        s <- s + d_grid[sub$dose[rp]] * alpha^((t_j - sub$arrival_time[rp]) / T)
       }
       Dij[idx[r]] <- s
     }
@@ -242,7 +242,7 @@ estimate_MTD_alphaCRM_integrate <- function(
   
   for (a in seq_len(A)) {
     alpha <- alpha_grid[a]
-    Dij <- compute_Dij_alpha(tmp, alpha, T)
+    Dij <- compute_Dij_alpha(tmp, alpha, T, d_grid)
     S_at_D <- interp_S_vec(Dij, d_grid, s_grid)
     S_at_D <- pmin(1 - eps, pmax(eps, S_at_D))
     cache_S[[a]] <- S_at_D
