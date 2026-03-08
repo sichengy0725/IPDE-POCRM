@@ -1,0 +1,70 @@
+model {
+
+  #### Priors
+  theta ~ dnorm(0, 0.5)     # Var = 2
+  alpha ~ dunif(0, 1)
+
+  #### Likelihood + custom (masked) Bernoulli likelihood via zeros trick
+  for (i in 1:I) {
+    for (j in 1:Jmax) {
+
+      # 1 if administration (i,j) exists (complete-only dataset), else 0
+      # use_ij[i,j] <- step(ncyc[i] - j + 0.5)
+
+      #### ---- discounted cumulative dose D_ij (NO redefinition, NO if, fixed loops)
+
+      # contributions from each prior cycle jp (turned on/off by indicators)
+      for (jp in 1:Jmax) {
+        contrib[i,j,jp] <- step(j - jp + 0.5) *           # jp <= j
+                           step(ncyc[i] - jp + 0.5) *     # jp <= ncyc[i]
+                           dose[i,jp] *
+                           pow(alpha, (time[i,j] - time[i,jp]) / T)
+      }
+
+      # cumulative sum over jp = 1..Jmax
+      sumD[i,j,1] <- contrib[i,j,1]
+      for (jp in 2:Jmax) {
+        sumD[i,j,jp] <- sumD[i,j,jp-1] + contrib[i,j,jp]
+      }
+
+      Dij[i,j] <- sumD[i,j,Jmax]
+
+      #### ---- map Dij to S(Dij) using skeleton interpolation
+
+      # interval indicators for k=1..K-1: d_k <= Dij < d_{k+1}
+      for (k in 1:(K-1)) {
+        inbin[i,j,k] <- step(Dij[i,j] - dgrid[k]) *
+                        (1 - step(Dij[i,j] - dgrid[k+1]))
+      }
+
+      # linear interpolation inside grid (if Dij < dgrid[K])
+      Sin[i,j] <- 0
+      for (k in 1:(K-1)) {
+        Sk[i,j,k] <- sgrid[k] +
+          (Dij[i,j] - dgrid[k]) / (dgrid[k+1] - dgrid[k]) *
+          (sgrid[k+1] - sgrid[k])
+        Sin[i,j] <- Sin[i,j] + inbin[i,j,k] * Sk[i,j,k]
+      }
+
+      # linear extrapolation beyond top dose (if Dij >= dgrid[K])
+      Sex[i,j] <- sgrid[K-1] +
+        (Dij[i,j] - dgrid[K-1]) / (dgrid[K] - dgrid[K-1]) *
+        (sgrid[K] - sgrid[K-1])
+
+      above[i,j] <- step(Dij[i,j] - dgrid[K])
+
+      Sraw[i,j] <- (1 - above[i,j]) * Sin[i,j] + above[i,j] * Sex[i,j]
+      eps <- 1e-12
+      # clamp to avoid log(0)
+      S[i,j] <- max(eps, min(1 - eps, Sraw[i,j]))
+
+      #### ---- CRM power model
+      p[i,j] <- pow(S[i,j], exp(theta))
+      C <- 100
+      #### ---- zeros trick likelihood (masks padded cells)
+      loglik[i,j] <- y[i,j] * log(p[i,j]) + (1 - y[i,j]) * log(1 - p[i,j])
+      phi[i,j]    <- -use[i,j] * loglik[i,j] + C
+      zeros[i,j]  ~ dpois(phi[i,j])
+    }
+  }
+}

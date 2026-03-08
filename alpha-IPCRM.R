@@ -1,0 +1,493 @@
+
+library(coda)
+library(rjags)
+library(mvtnorm)
+build_temp_rows <- function(patient_df, t_now, window, p) {
+  
+  # only administrations that already occurred
+  tmp <- patient_df[patient_df$arrival_time <= t_now, , drop = FALSE]
+  
+  if (nrow(tmp) == 0) return(tmp)
+  
+  # make sure rows are ordered within patient by cycle / time
+  tmp <- tmp[order(tmp$id, tmp$cycle, tmp$arrival_time), , drop = FALSE]
+  
+  # raw dose amount corresponding to dose index
+  tmp$dose_raw <- p[tmp$dose]
+  
+  # cumulative dose PRIOR to current administration, using raw dose
+  tmp$cumu_dose <- ave(
+    tmp$dose_raw,
+    tmp$id,
+    FUN = function(x) c(0, cumsum(x)[-length(x)])
+  )
+  
+  # 1) has the DLT already been observed?
+  tmp$y_obs <- as.integer(tmp$DLT_time <= t_now)
+  
+  # 2) is the toxicity outcome now known?
+  # known if either DLT occurred OR window finished
+  tmp$complete <- as.integer(tmp$y_obs == 1L | tmp$eval_time <= t_now)
+  
+  # keep only rows whose toxicity status is known
+  tmp <- tmp[tmp$complete == 1, , drop = FALSE]
+  
+  return(tmp)
+}
+# ------------------------------------------------------------
+# Posterior MTD estimator (handles all 4 model types)
+# ------------------------------------------------------------
+estimate_MTD_JAGS <- function(y, d_level, p, Tcum, pid,
+                              TARGET = 0.3,
+                              cutoff = 0.96,
+                              model_file = "logit.bug",
+                              n.chains = 3,
+                              n.adapt  = 1000,
+                              n.burn   = 2000,
+                              n.iter   = 5000,
+                              thin     = 2,
+                              # for CO / CO-RF posterior curve definition
+                              T_ref_for_curve = 0) {
+  
+  stopifnot(length(y) == length(d_level),
+            length(y) == length(Tcum),
+            length(y) == length(pid))
+  
+  Nobs <- length(y)
+  nPat <- if (Nobs == 0) 0L else max(pid)
+  
+  # d in the JAGS model is the numeric dose on model scale
+  # Here: use standardized/working dose values p[d_level]
+  d_numeric <- as.numeric(p[d_level])
+  T_numeric <- as.numeric(Tcum)
+  pid_int   <- as.integer(pid)
+  
+  data_jags <- list(
+    Nobs = Nobs,
+    nPat = nPat,
+    y_bin = as.integer(y),
+    d = d_numeric,
+    T = T_numeric,
+    pid = pid_int
+  )
+  
+  jags <- rjags::jags.model(
+    file   = model_file,
+    data   = data_jags,
+    n.chains = n.chains,
+    n.adapt  = n.adapt,
+    quiet = TRUE
+  )
+  
+  update(jags, n.burn, progress.bar = "none")
+  
+  # Decide which parameters to monitor
+  is_CO   <- model_file %in% c("logit_CO.bug", "logit_CORF.bug")
+  is_RF   <- model_file %in% c("logit_RF.bug", "logit_CORF.bug")
+  
+  var.names <- c("beta0", "beta1")
+  if (is_CO) var.names <- c(var.names, "beta2")
+  if (is_RF) var.names <- c(var.names, "sigma") # u[] not needed for dose curve
+  
+  smp <- coda.samples(
+    model          = jags,
+    variable.names = var.names,
+    n.iter         = n.iter,
+    thin           = thin,
+    progress.bar   = "none"
+  )
+  
+  draws <- as.matrix(smp)
+  b0 <- draws[, "beta0"]
+  b1 <- draws[, "beta1"]
+  b2 <- if (is_CO) draws[, "beta2"] else 0
+  sigma <- if(is_RF) draws[,"sigma"] else 0
+  
+  J <- length(p)
+  
+  # Dose-level posterior mean tox curve
+  # - logit/RF: logit^{-1}(b0 + b1*p[j])
+  # - CO/CO-RF: logit^{-1}(b0 + b1*p[j] + b2*T_ref_for_curve)
+  if(!is_CO & is_RF){
+    M <- 200  # MC patients per posterior draw
+    U <- matrix(rnorm(length(b0) * M), nrow = length(b0), ncol = M) * sigma
+    
+    eta <- outer(b0, rep(1, J)) + outer(b1, p)  # ndraw x J
+    
+    # p_j_draws: ndraw x J, each row is E_u[...] approximated by MC
+    p_j_draws <- sapply(seq_len(J), function(j) rowMeans(plogis(eta[, j] + U)))
+    
+    posttox <- colMeans(p_j_draws)
+    
+    # early stop consistent with same definition
+    p1_draws <- p_j_draws[, 1]
+    prob_overtox <- mean(p1_draws > TARGET)
+    stop_flag <- as.integer(prob_overtox > cutoff)
+  }
+  if(is_CO & !is_RF){
+    # Early stop rule: Pr(p1 > TARGET | data) > cutoff
+    # Define p1 consistently with curve definition (T_ref_for_curve).
+    pi1_draws <- plogis(b0 + b1 * p[1] + b2 * T_ref_for_curve)
+    prob_overtox <- mean(pi1_draws > TARGET)
+    stop_flag <- as.integer(prob_overtox > cutoff)
+    posttox <- vapply(seq_len(J), function(j) {
+      mean(plogis(b0 + b1 * p[j] + b2 * T_ref_for_curve))
+    }, numeric(1))
+  }
+  # browser()
+  cat('posttox', posttox, '\n')
+  cat('prob_overtox', prob_overtox, '\n')
+  # MTD = closest to TARGET
+  diff <- abs(posttox - TARGET)
+  dose.best <- which(diff == min(diff))[1]
+  
+  
+  
+  
+  list(
+    MTD = dose.best,
+    posttox = posttox,
+    prob_overtox = prob_overtox,
+    stop = stop_flag
+  )
+}
+simulate_IPCRM_trial <- function(
+    PI, PI_ipde, J = length(PI), p,
+    COHORTSIZE = 3,
+    ncohort = 10,            # cap by cohorts (Nmax = COHORTSIZE*ncohort)
+    Kmax = 3,                # max IPDE cycles per participant
+    TARGET = 0.30,
+    cutoff = 0.95,
+    window = 28,
+    arrival_rate = 1/14,     # Poisson: mean inter-arrival 14 days
+    seed = 1,
+    verbose = FALSE,
+    ordering,                # ordering for IPDE-POCRM
+    model_file = 'logit_CO.bug'
+) {
+  set.seed(seed)
+  Nmax <- COHORTSIZE * ncohort
+  ndose <- length(PI)
+  is_CO <- model_file %in% c("logit_CO.bug", "logit_CORF.bug")
+  
+  p_model <- p
+  if (is_CO) {
+    p_model <- c(.1, .3, .5, .7, .9)
+    p_model <- p_model / (2 * sd(p_model))
+  }
+  
+  # administration-level table; each row = one dosing (cycle) for some patient
+  patient <- data.frame(
+    id = integer(0),
+    cycle = integer(0),
+    dose = integer(0),
+    arrival_time = numeric(0),  # this row's admin time (use arrival_time name to match your block)
+    eval_time = numeric(0),
+    DLT_time = numeric(0),                 
+    ipde_true = integer(0),
+    ipde_ok = integer(0),
+    y = integer(0),           # latent truth (1 if will have DLT in this window)
+    MTD = integer(0)                   # Current MTD level when patient enrolled
+  )
+  
+  # participant-level state
+  active <- rep(FALSE, Nmax)
+  current_dose <- rep(NA_integer_, Nmax)
+  current_cycle <- rep(0L, Nmax)      # number of doses administered so far
+  stop_reason <- rep(NA_character_, Nmax)
+  
+  # accrual bookkeeping
+  t_last <- 0
+  next_pid <- 0L
+  j_recent <- 1L
+  MTD_hat <- 1L
+  tmp_last  <- patient[0, ]   # empty
+  t_mtd     <- -Inf           # time of last MTD update
+  # j_S_prev <- 1L
+  #stop the trial due to overtoxicity
+  trial_stop = 0
+  #stop IPDE due to patient cap
+  stop_ipde = 0
+  # event loop needs next cohort arrival time. We'll generate cohort-by-cohort using your block.
+  # But evaluation events can occur between cohort arrivals, so we manage them explicitly.
+  
+  for (coh in 1:ncohort) {
+    
+    # -------- 0) process ALL evaluation events that occur before next cohort arrival (unknown yet)
+    # We'll first generate the next cohort arrival times (for this cohort), and treat the FIRST arrival
+    # in the cohort as the "next cohort arrival event time" for flushing pending evals.
+    # This matches your cohort-level generation while still being event-driven enough.
+    #
+    # If you want per-participant arrivals (not batched cohorts), switch COHORTSIZE=1.
+    
+    # -------- 1) Generate this cohort's arrival times using YOUR code (Poisson process) ----------
+    interarrival <- rexp(COHORTSIZE, rate = arrival_rate)
+    arrival_time <- t_last + cumsum(interarrival) # vector length COHORTSIZE
+    t_last <- tail(arrival_time, 1)
+    
+    # Before enrolling them at their respective arrival times,
+    # we must process eval events up to each arrival in order.
+    for (k in 1:COHORTSIZE) {
+      
+      t_now <- arrival_time[k]
+      
+      # -------- 2) process evaluation completions up to time t_now (can cascade with IPDE) ------
+      repeat {
+        # find the earliest unevaluated administration whose eval_time <= t_now
+        pending_idx <- which(patient$eval_time <= t_now & patient$ipde_ok)  # evaluated by calendar time
+        if (length(pending_idx) == 0) break
+        # process them in chronological order, one by one
+        r <- pending_idx[which.min(patient$eval_time[pending_idx])]
+        t_admin <- patient$eval_time[r]
+        pid <- patient$id[r]
+        d_cur <- patient$dose[r]
+        cyc <- patient$cycle[r]
+        
+        # if participant already inactive, nothing to do (but row is "evaluated" conceptually)
+        if (!active[pid]) {
+          # drop row from further consideration by setting eval_time to Inf (or mark a flag)
+          patient$ipde_ok[r] = 0
+          next
+        }
+        
+        # build temp dataset at evaluation time (this is the "temporary dataset" for estimation)
+        tmp <- build_temp_rows(patient, t_admin, window, p_model)  # your complete-only builder
+        print(tmp)
+        # est <- estimate_MTD_alphaCRM_integrate(
+        #   tmp = tmp,
+        #   d_grid = c(15,20,30,35,45),
+        #   s_grid = skeleton,
+        #   TARGET = TARGET,
+        #   cutoff = cutoff,
+        #   T = window
+        # )
+        est <- estimate_MTD_JAGS(tmp$y, tmp$dose, p_model, tmp$cumu_dose, tmp$id,
+                                 TARGET = TARGET,
+                                 cutoff = cutoff,
+                                 model_file = model_file)
+        cat('Post Tox', est$posttox, '\n')
+        cat('MTD', est$MTD, '\n')
+        MTD_hat <- est$MTD
+        tmp_last <- tmp
+        MTD_hat  <- est$MTD
+        t_mtd    <- t_admin
+        stop <- est$stop
+        if(stop){
+          trial_stop = TRUE
+          break
+        }
+        # observe DLT by time t_now for this row
+        y_obs <- as.integer(patient$DLT_time[r] <= t_admin)
+        
+        if (verbose) {
+          cat(sprintf("[EVAL] t=%.2f pid=%d cycle=%d dose=%d y_obs=%d MTD=%d n_eval_d=%d\n",
+                      t_now, pid, cyc, d_cur, y_obs, MTD_hat,
+                      evaluated_count(patient, d_cur, t_admin)))
+        }
+        
+        # "consume" this evaluated row so we don't process it again
+        
+        # stop on DLT
+        if (y_obs == 1L) {
+          active[pid] <- FALSE
+          if (is.na(stop_reason[pid])) stop_reason[pid] <- "DLT"
+          next
+        }
+        
+        # stop if reached max cycles
+        if (cyc >= Kmax) {
+          active[pid] <- FALSE
+          if (is.na(stop_reason[pid])) stop_reason[pid] <- "maxK"
+          next
+        }
+        
+        n_complete_d <- sum(tmp$dose == d_cur & tmp$complete == 1L)
+        
+        can_escalate <- (y_obs == 0L) &&
+          (MTD_hat > d_cur) &&
+          (n_complete_d >= 3L) &&
+          (d_cur < J)
+        
+        if (!can_escalate) {
+          active[pid] <- FALSE
+          if (is.na(stop_reason[pid])) stop_reason[pid] <- "no_escalation"
+          next
+        }
+        
+        # -------- 3) Escalate immediately: add a NEW administration row at time t_now -----------
+        new_dose <- d_cur + 1L
+        new_cycle <- cyc + 1L
+        # -------- 3) Escalate immediately: add a NEW administration row -----------
+        if (nrow(patient) >= Nmax) {
+          stop_ipde <- 1L
+          break
+        }
+        # generate latent truth for the new administration (your mechanism)
+        y_new <- rbinom(1L, 1L, PI_ipde[new_dose])
+        eval_new <- t_admin + window 
+        DLT_new <- Inf
+        if (y_new == 1L) DLT_new <- t_admin + sample.int(window, size = 1, replace = TRUE)
+        patient$ipde_ok[r] = 0
+        patient <- rbind(
+          patient,
+          data.frame(
+            id = pid,
+            cycle = new_cycle,
+            dose = new_dose,
+            arrival_time = t_admin,
+            eval_time = eval_new,
+            DLT_time = DLT_new,
+            ipde_true = 1,
+            ipde_ok = 1,
+            y = y_new,
+            MTD = MTD_hat
+          )
+        )
+        
+        current_dose[pid] <- new_dose
+        current_cycle[pid] <- new_cycle
+        # j_recent <- new_dose
+        
+        if (verbose) {
+          cat(sprintf("      -> ESCALATE pid=%d to dose=%d (cycle=%d), new eval=%.2f\n",
+                      pid, new_dose, new_cycle, eval_new))
+        }
+      } # end repeat eval processing
+      #if the trial stops in inner intra-patient escalation stage, jump out the loop
+      if(trial_stop | stop_ipde){
+        break
+      }
+      # -------- 4) Decide starting dose for this arriving participant --------------------------
+      # build temp dataset at arrival time and estimate MTD (placeholder)
+      # tmp <- build_temp_rows(patient, t_now, window)
+      # est <- estimate_MTD_POCRM(ordering,
+      #                           tmp,
+      #                           skeleton,
+      #                           ndose,
+      #                           TARGET,
+      #                           cutoff)
+      # j_MTD <- est$MTD
+      # #if trial stops when new patient arrives, jump out the loop
+      # if(est$stop){
+      #   trial_stop = 1
+      #   break
+      # }
+      n_complete_recent <- sum(tmp_last$dose == j_recent & tmp_last$complete == 1L)
+      
+      if (MTD_hat > j_recent && n_complete_recent >= 3L) {
+        j_S_curr <- min(j_recent + 1L, J)
+      } else if (MTD_hat > j_recent && n_complete_recent < 3L) {
+        j_S_curr <- j_recent
+      } else if (MTD_hat < j_recent) {
+        j_S_curr <- max(j_recent - 1L, 1L)
+      } else {
+        j_S_curr <- MTD_hat
+      }
+      j_recent <- j_S_curr
+      # enroll ONE participant at this arrival time (k-th in the cohort)
+      if (nrow(patient) >= Nmax) {break}
+      next_pid <- next_pid + 1L
+      pid_new <- next_pid
+      
+      active[pid_new] <- TRUE
+      current_dose[pid_new] <- j_S_curr
+      current_cycle[pid_new] <- 1L
+      
+      # -------- 5) Generate this participant's first administration row USING YOUR BLOCK -------
+      y0 <- rbinom(1L, 1L, PI[j_S_curr])
+      eval0 <- t_now + window
+      DLT0 <- Inf
+      if (y0 == 1L) DLT0 <- t_now + sample.int(window, size = 1, replace = TRUE)
+      new_pat <- data.frame(
+        id = pid_new,
+        cycle = 1L,
+        dose = j_S_curr,
+        arrival_time = t_now,  # admin time
+        eval_time = eval0,
+        DLT_time = DLT0,
+        y = y0,
+        ipde_true = 0,
+        ipde_ok = 1,
+        MTD = MTD_hat
+      )
+      patient <- rbind(patient, new_pat)
+      
+      if (verbose) {
+        cat(sprintf("[ARR] t=%.2f pid=%d startdose=%d eval=%.2f y(latent)=%d\n",
+                    t_now, pid_new, j_S_curr, eval0, y0))
+      }
+      #trial stops with total of N assignments
+      if (nrow(patient) >= Nmax) break
+    } # end within-cohort arrivals
+    
+    if (nrow(patient) >= Nmax) break
+  } # end cohorts
+  if(nrow(patient) == 0){t_final = 0}
+  else{
+    t_start <- min(patient$arrival_time[patient$ipde_true == 0L])
+    t_end   <- max(patient$eval_time)
+    t_final <- t_end - t_start
+  }
+  
+  if (trial_stop) {
+    final_MTD = 99
+    est_final <- list(MTD=NA, posttox=rep(NA, ndose))
+  }
+  # After accrual ends, you can optionally flush all remaining evals to finalize MTD
+  # Here we just compute final estimate at t_now = max arrival + window
+  else{
+    
+    # build temp dataset at evaluation time (this is the "temporary dataset" for estimation)
+    tmp_final <- build_temp_rows(patient, t_end, window, p_model)  # your complete-only builder
+    
+    est_final <- estimate_MTD_JAGS(tmp_final$y, 
+                                   tmp_final$dose, 
+                                   p_model, 
+                                   tmp_final$cumu.dose, 
+                                   tmp_final$id,
+                                   TARGET = TARGET,
+                                   cutoff = cutoff,
+                                   model_file = model_file)
+    # p_real <- est_final$posttox
+    # jmax   <- max(tmp_final$dose) 
+    # 
+    # cand   <- 1:jmax
+    # final_MTD <- cand[ which.min(abs(p_real[cand] - TARGET)) ]
+    final_MTD <- est_final$MTD
+    if(est_final$stop){
+      final_MTD = 99
+      est_final <- list(MTD=NA, posttox=rep(NA, ndose))
+    }
+  }
+  list(
+    patient = patient,
+    stop_reason = stop_reason[1:next_pid],
+    final_MTD = final_MTD,
+    posttox = est_final$posttox,
+    trial_time = t_final,
+    trial_stop = trial_stop
+  )
+}
+
+backsol <- function(ske, mu_beta0, mu_beta1){
+  dose = (log(ske/(1-ske)) - mu_beta0)/mu_beta1
+}
+ske1 = c(0.02, 0.12, 0.3, 0.5, 0.65)
+#backsolve for d_j
+dose = backsol(ske1, mu_beta0 = 3, mu_beta1 = 1)
+model_file = 'logit_CO.bug'
+alpha = 0.3
+sce1 <- ipde_probabilities(c = 0, alpha)
+res1 <- simulate_IPCRM_trial(PI = sce1$p_base, PI_ipde = sce1$p_ipde, J = length(ske1), p = dose,
+                             COHORTSIZE = 3,
+                             ncohort = 10,            # cap by cohorts (Nmax = COHORTSIZE*ncohort)
+                             Kmax = 2,                # max IPDE cycles per participant
+                             TARGET = 0.30,
+                             cutoff = 0.76,
+                             window = 28,
+                             arrival_rate = 1/14,     # Poisson: mean inter-arrival 14 days
+                             seed = 2,
+                             verbose = FALSE,
+                             ordering,                # ordering for IPDE-POCRM
+                             model_file = 'logit_CO.bug'
+                            )
