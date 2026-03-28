@@ -1,181 +1,29 @@
-
+setwd('/rsrch8/home/biostatistics/syang10/IPDE-POCRM-main/IPDE-POCRM-main')
+.libPaths("/rsrch8/home/biostatistics/syang10/R/x86_64-pc-linux-gnu-library/4.4")
 library(coda)
 library(rjags)
 library(mvtnorm)
-build_temp_rows <- function(patient_df, t_now, window, p) {
-  
-  # only administrations that already occurred
-  tmp <- patient_df[patient_df$arrival_time <= t_now, , drop = FALSE]
-  
-  if (nrow(tmp) == 0) return(tmp)
-  
-  # make sure rows are ordered within patient by cycle / time
-  tmp <- tmp[order(tmp$id, tmp$cycle, tmp$arrival_time), , drop = FALSE]
-  
-  # raw dose amount corresponding to dose index
-  tmp$dose_raw <- p[tmp$dose]
-  
-  # cumulative dose PRIOR to current administration, using raw dose
-  tmp$cumu_dose <- ave(
-    tmp$dose_raw,
-    tmp$id,
-    FUN = function(x) c(0, cumsum(x)[-length(x)])
-  )
-  
-  # 1) has the DLT already been observed?
-  tmp$y_obs <- as.integer(tmp$DLT_time <= t_now)
-  
-  # 2) is the toxicity outcome now known?
-  # known if either DLT occurred OR window finished
-  tmp$complete <- as.integer(tmp$y_obs == 1L | tmp$eval_time <= t_now)
-  
-  # keep only rows whose toxicity status is known
-  tmp <- tmp[tmp$complete == 1, , drop = FALSE]
-  
-  return(tmp)
-}
-# ------------------------------------------------------------
-# Posterior MTD estimator (handles all 4 model types)
-# ------------------------------------------------------------
-estimate_MTD_JAGS <- function(y, d_level, p, Tcum, pid,
-                              TARGET = 0.3,
-                              cutoff = 0.96,
-                              model_file = "logit.bug",
-                              n.chains = 3,
-                              n.adapt  = 1000,
-                              n.burn   = 2000,
-                              n.iter   = 5000,
-                              thin     = 2,
-                              # for CO / CO-RF posterior curve definition
-                              T_ref_for_curve = 0) {
-  
-  stopifnot(length(y) == length(d_level),
-            length(y) == length(Tcum),
-            length(y) == length(pid))
-  
-  Nobs <- length(y)
-  nPat <- if (Nobs == 0) 0L else max(pid)
-  
-  # d in the JAGS model is the numeric dose on model scale
-  # Here: use standardized/working dose values p[d_level]
-  d_numeric <- as.numeric(p[d_level])
-  T_numeric <- as.numeric(Tcum)
-  pid_int   <- as.integer(pid)
-  
-  data_jags <- list(
-    Nobs = Nobs,
-    nPat = nPat,
-    y_bin = as.integer(y),
-    d = d_numeric,
-    T = T_numeric,
-    pid = pid_int
-  )
-  
-  jags <- rjags::jags.model(
-    file   = model_file,
-    data   = data_jags,
-    n.chains = n.chains,
-    n.adapt  = n.adapt,
-    quiet = TRUE
-  )
-  
-  update(jags, n.burn, progress.bar = "none")
-  
-  # Decide which parameters to monitor
-  is_CO   <- model_file %in% c("logit_CO.bug", "logit_CORF.bug")
-  is_RF   <- model_file %in% c("logit_RF.bug", "logit_CORF.bug")
-  
-  var.names <- c("beta0", "beta1")
-  if (is_CO) var.names <- c(var.names, "beta2")
-  if (is_RF) var.names <- c(var.names, "sigma") # u[] not needed for dose curve
-  
-  smp <- coda.samples(
-    model          = jags,
-    variable.names = var.names,
-    n.iter         = n.iter,
-    thin           = thin,
-    progress.bar   = "none"
-  )
-  
-  draws <- as.matrix(smp)
-  b0 <- draws[, "beta0"]
-  b1 <- draws[, "beta1"]
-  b2 <- if (is_CO) draws[, "beta2"] else 0
-  sigma <- if(is_RF) draws[,"sigma"] else 0
-  
-  J <- length(p)
-  
-  # Dose-level posterior mean tox curve
-  # - logit/RF: logit^{-1}(b0 + b1*p[j])
-  # - CO/CO-RF: logit^{-1}(b0 + b1*p[j] + b2*T_ref_for_curve)
-  if(!is_CO & is_RF){
-    M <- 200  # MC patients per posterior draw
-    U <- matrix(rnorm(length(b0) * M), nrow = length(b0), ncol = M) * sigma
-    
-    eta <- outer(b0, rep(1, J)) + outer(b1, p)  # ndraw x J
-    
-    # p_j_draws: ndraw x J, each row is E_u[...] approximated by MC
-    p_j_draws <- sapply(seq_len(J), function(j) rowMeans(plogis(eta[, j] + U)))
-    
-    posttox <- colMeans(p_j_draws)
-    
-    # early stop consistent with same definition
-    p1_draws <- p_j_draws[, 1]
-    prob_overtox <- mean(p1_draws > TARGET)
-    stop_flag <- as.integer(prob_overtox > cutoff)
-  }
-  if(is_CO & !is_RF){
-    # Early stop rule: Pr(p1 > TARGET | data) > cutoff
-    # Define p1 consistently with curve definition (T_ref_for_curve).
-    pi1_draws <- plogis(b0 + b1 * p[1] + b2 * T_ref_for_curve)
-    prob_overtox <- mean(pi1_draws > TARGET)
-    stop_flag <- as.integer(prob_overtox > cutoff)
-    posttox <- vapply(seq_len(J), function(j) {
-      mean(plogis(b0 + b1 * p[j] + b2 * T_ref_for_curve))
-    }, numeric(1))
-  }
-  # browser()
-  cat('posttox', posttox, '\n')
-  cat('prob_overtox', prob_overtox, '\n')
-  # MTD = closest to TARGET
-  diff <- abs(posttox - TARGET)
-  dose.best <- which(diff == min(diff))[1]
-  
-  
-  
-  
-  list(
-    MTD = dose.best,
-    posttox = posttox,
-    prob_overtox = prob_overtox,
-    stop = stop_flag
-  )
-}
+source('functions.R')
 simulate_IPCRM_trial <- function(
-    PI, PI_ipde, J = length(PI), p,
+    PI, PI_ipde, 
+    J = length(PI),
     COHORTSIZE = 3,
     ncohort = 10,            # cap by cohorts (Nmax = COHORTSIZE*ncohort)
     Kmax = 3,                # max IPDE cycles per participant
     TARGET = 0.30,
-    cutoff = 0.95,
     window = 28,
     arrival_rate = 1/14,     # Poisson: mean inter-arrival 14 days
     seed = 1,
-    verbose = FALSE,
-    ordering,                # ordering for IPDE-POCRM
-    model_file = 'logit_CO.bug'
+    verbose = FALSE,             
+    model = 'IPCRM',
+    parameters,
+    escalation_rule_ipde = 1,
+    escalation_rule_new = 1     #1: alphacrm with n >= 3, 2: no >= 3
 ) {
   set.seed(seed)
   Nmax <- COHORTSIZE * ncohort
   ndose <- length(PI)
-  is_CO <- model_file %in% c("logit_CO.bug", "logit_CORF.bug")
-  
-  p_model <- p
-  if (is_CO) {
-    p_model <- c(.1, .3, .5, .7, .9)
-    p_model <- p_model / (2 * sd(p_model))
-  }
-  
+  is_CO <- model %in% c("IPCRM-CO")
   # administration-level table; each row = one dosing (cycle) for some patient
   patient <- data.frame(
     id = integer(0),
@@ -251,22 +99,37 @@ simulate_IPCRM_trial <- function(
         }
         
         # build temp dataset at evaluation time (this is the "temporary dataset" for estimation)
-        tmp <- build_temp_rows(patient, t_admin, window, p_model)  # your complete-only builder
-        print(tmp)
-        # est <- estimate_MTD_alphaCRM_integrate(
-        #   tmp = tmp,
-        #   d_grid = c(15,20,30,35,45),
-        #   s_grid = skeleton,
-        #   TARGET = TARGET,
-        #   cutoff = cutoff,
-        #   T = window
-        # )
-        est <- estimate_MTD_JAGS(tmp$y, tmp$dose, p_model, tmp$cumu_dose, tmp$id,
-                                 TARGET = TARGET,
-                                 cutoff = cutoff,
-                                 model_file = model_file)
-        cat('Post Tox', est$posttox, '\n')
-        cat('MTD', est$MTD, '\n')
+        if(model %in% c('IPCRM-CO', 'IPCRM')){
+          tmp <- build_temp_rows(patient, t_admin, window, parameters$d)  # your complete-only builder
+        }
+        else{
+          tmp <- build_temp_rows(patient, t_admin, window)
+        }
+        if(model %in% c('IPCRM', 'IPCRM-CO')){
+          est <- estimate_MTD_JAGS(tmp$y, tmp$dose, parameters$d, tmp$cumu_dose, tmp$id,
+                                   TARGET = TARGET,
+                                   cutoff = parameters$cutoff,
+                                   model_file = parameters$model_file)
+        }
+        if(model %in% c('Alpha-CRM')){
+          est <- estimate_MTD_alphaCRM_integrate(
+            tmp = tmp,
+            d_grid = parameters$d_grid,
+            s_grid = parameters$s_grid,
+            TARGET = TARGET,
+            cutoff = parameters$cutoff,
+            T = window
+          )
+        }
+        if(model %in% c("POCRM")){
+          est <- estimate_MTD_POCRM(parameters$ordering,
+                                    tmp,
+                                    parameters$skeleton,
+                                    ndose,
+                                    TARGET,
+                                    parameters$cutoff,
+                                    model_file = parameters$model_file)
+        }
         MTD_hat <- est$MTD
         tmp_last <- tmp
         MTD_hat  <- est$MTD
@@ -302,12 +165,23 @@ simulate_IPCRM_trial <- function(
         }
         
         n_complete_d <- sum(tmp$dose == d_cur & tmp$complete == 1L)
-        
-        can_escalate <- (y_obs == 0L) &&
-          (MTD_hat > d_cur) &&
-          (n_complete_d >= 3L) &&
-          (d_cur < J)
-        
+        if(escalation_rule_ipde == 1){
+          can_escalate <- (y_obs == 0L) &&
+            (MTD_hat > d_cur) &&
+            (n_complete_d >= 3L) &&
+            (d_cur < J)
+        }
+        if(escalation_rule_ipde == 2){
+          can_escalate <- (y_obs == 0L) &&
+            (MTD_hat > d_cur) &&
+            (d_cur < J)
+        }
+        #IPCRM
+        if(escalation_rule_ipde == 3){
+          can_escalate <- (y_obs == 0L) &&
+            (MTD_hat >= d_cur) &&
+            (d_cur < J)
+        }
         if (!can_escalate) {
           active[pid] <- FALSE
           if (is.na(stop_reason[pid])) stop_reason[pid] <- "no_escalation"
@@ -326,7 +200,12 @@ simulate_IPCRM_trial <- function(
         y_new <- rbinom(1L, 1L, PI_ipde[new_dose])
         eval_new <- t_admin + window 
         DLT_new <- Inf
-        if (y_new == 1L) DLT_new <- t_admin + sample.int(window, size = 1, replace = TRUE)
+        if(window == 0){
+          if (y_new == 1L) DLT_new <- t_admin 
+        }
+        else{
+          if (y_new == 1L) DLT_new <- t_admin + sample.int(window, size = 1, replace = TRUE)
+        }
         patient$ipde_ok[r] = 0
         patient <- rbind(
           patient,
@@ -358,30 +237,47 @@ simulate_IPCRM_trial <- function(
         break
       }
       # -------- 4) Decide starting dose for this arriving participant --------------------------
-      # build temp dataset at arrival time and estimate MTD (placeholder)
-      # tmp <- build_temp_rows(patient, t_now, window)
-      # est <- estimate_MTD_POCRM(ordering,
-      #                           tmp,
-      #                           skeleton,
-      #                           ndose,
-      #                           TARGET,
-      #                           cutoff)
-      # j_MTD <- est$MTD
-      # #if trial stops when new patient arrives, jump out the loop
-      # if(est$stop){
-      #   trial_stop = 1
-      #   break
-      # }
       n_complete_recent <- sum(tmp_last$dose == j_recent & tmp_last$complete == 1L)
-      
-      if (MTD_hat > j_recent && n_complete_recent >= 3L) {
-        j_S_curr <- min(j_recent + 1L, J)
-      } else if (MTD_hat > j_recent && n_complete_recent < 3L) {
-        j_S_curr <- j_recent
-      } else if (MTD_hat < j_recent) {
-        j_S_curr <- max(j_recent - 1L, 1L)
-      } else {
-        j_S_curr <- MTD_hat
+      if(escalation_rule_new == 1){
+        if (MTD_hat > j_recent && n_complete_recent >= 3L) {
+          j_S_curr <- min(j_recent + 1L, J)
+        } else if (MTD_hat > j_recent && n_complete_recent < 3L) {
+          j_S_curr <- j_recent
+        } else if (MTD_hat < j_recent) {
+          j_S_curr <- max(j_recent - 1L, 1L)
+        } else {
+          j_S_curr <- MTD_hat
+        }
+      }
+      if(escalation_rule_new == 2){
+        if (MTD_hat > j_recent) {
+          j_S_curr <- min(j_recent + 1L, J)
+        } else if (MTD_hat < j_recent) {
+          j_S_curr <- max(j_recent - 1L, 1L)
+        } else {
+          j_S_curr <- MTD_hat
+        }
+      }
+      if(escalation_rule_new == 3) {
+        if(nrow(patient) == 0){
+          j_S_curr = 1
+        } else {
+          j_H <- max(patient$dose)
+          
+          if (MTD_hat > j_H) {
+            j_S_curr <- min(j_H + 1L, J)
+          } else if (MTD_hat == j_H) {
+            j_S_curr <- j_H
+          } else {
+            # MTD_hat < j_H
+            if (MTD_hat >= j_recent) {
+              j_S_curr <- MTD_hat
+            } else {
+              j_S_curr <- max(j_recent - 1L, 1L)
+            }
+          }  
+        }
+
       }
       j_recent <- j_S_curr
       # enroll ONE participant at this arrival time (k-th in the cohort)
@@ -397,7 +293,12 @@ simulate_IPCRM_trial <- function(
       y0 <- rbinom(1L, 1L, PI[j_S_curr])
       eval0 <- t_now + window
       DLT0 <- Inf
-      if (y0 == 1L) DLT0 <- t_now + sample.int(window, size = 1, replace = TRUE)
+      if(window == 0){
+        if (y0 == 1L) DLT0 <- t_now 
+      }
+      else{
+        if (y0 == 1L) DLT0 <- t_now + sample.int(window, size = 1, replace = TRUE)
+      }
       new_pat <- data.frame(
         id = pid_new,
         cycle = 1L,
@@ -438,26 +339,57 @@ simulate_IPCRM_trial <- function(
   else{
     
     # build temp dataset at evaluation time (this is the "temporary dataset" for estimation)
-    tmp_final <- build_temp_rows(patient, t_end, window, p_model)  # your complete-only builder
-    
-    est_final <- estimate_MTD_JAGS(tmp_final$y, 
-                                   tmp_final$dose, 
-                                   p_model, 
-                                   tmp_final$cumu.dose, 
-                                   tmp_final$id,
-                                   TARGET = TARGET,
-                                   cutoff = cutoff,
-                                   model_file = model_file)
-    # p_real <- est_final$posttox
-    # jmax   <- max(tmp_final$dose) 
-    # 
-    # cand   <- 1:jmax
-    # final_MTD <- cand[ which.min(abs(p_real[cand] - TARGET)) ]
+    # tmp_final <- build_temp_rows(patient, t_end, window, p_model)  # your complete-only builder
+    if(model %in% c('IPCRM-CO', 'IPCRM')){
+      tmp_final <- build_temp_rows(patient, t_end, window, parameters$d)  # your complete-only builder
+    }
+    else{
+      tmp_final <- build_temp_rows(patient, t_end, window)
+    }
+    if(model %in% c('IPCRM', 'IPCRM-CO')){
+      est_final <- estimate_MTD_JAGS(tmp_final$y, 
+                                     tmp_final$dose, 
+                                     parameters$d, 
+                                     tmp_final$cumu_dose, 
+                                     tmp_final$id,
+                                     TARGET = TARGET,
+                                     cutoff = parameters$cutoff,
+                                     model_file = parameters$model_file)
+      
+    }
+   
+    if(model %in% c('Alpha-CRM')){
+      est_final <- estimate_MTD_alphaCRM_integrate(
+        tmp = tmp_final,
+        d_grid = parameters$d_grid,
+        s_grid = parameters$s_grid,
+        TARGET = TARGET,
+        cutoff = parameters$cutoff,
+        T = window
+      )
+    }
+    if(model %in% c("POCRM")){
+      est_final <- estimate_MTD_POCRM(parameters$ordering,
+                                tmp_final,
+                                parameters$skeleton,
+                                ndose,
+                                TARGET,
+                                parameters$cutoff,
+                                model_file = parameters$model_file)
+    }
     final_MTD <- est_final$MTD
     if(est_final$stop){
       final_MTD = 99
       est_final <- list(MTD=NA, posttox=rep(NA, ndose))
     }
+    else{
+      p_real <- est_final$posttox
+      jmax   <- max(tmp_final$dose) 
+      # 
+      cand   <- 1:jmax
+      final_MTD <- cand[ which.min(abs(p_real[cand] - TARGET))]
+    }
+    
   }
   list(
     patient = patient,
@@ -473,21 +405,79 @@ backsol <- function(ske, mu_beta0, mu_beta1){
   dose = (log(ske/(1-ske)) - mu_beta0)/mu_beta1
 }
 ske1 = c(0.02, 0.12, 0.3, 0.5, 0.65)
-#backsolve for d_j
+d_grid <- c(15, 20, 30, 35, 45)
+skeleton <- c(0.12, 0.20, 0.30, 0.40, 0.50)
+#backsolve for d_j for IPCRM
 dose = backsol(ske1, mu_beta0 = 3, mu_beta1 = 1)
-model_file = 'logit_CO.bug'
-alpha = 0.3
-sce1 <- ipde_probabilities(c = 0, alpha)
-res1 <- simulate_IPCRM_trial(PI = sce1$p_base, PI_ipde = sce1$p_ipde, J = length(ske1), p = dose,
-                             COHORTSIZE = 3,
-                             ncohort = 10,            # cap by cohorts (Nmax = COHORTSIZE*ncohort)
-                             Kmax = 2,                # max IPDE cycles per participant
-                             TARGET = 0.30,
-                             cutoff = 0.76,
-                             window = 28,
-                             arrival_rate = 1/14,     # Poisson: mean inter-arrival 14 days
-                             seed = 2,
-                             verbose = FALSE,
-                             ordering,                # ordering for IPDE-POCRM
-                             model_file = 'logit_CO.bug'
-                            )
+#dose for IPCRM-CO
+co_dose <- c(.1, .3, .5, .7, .9)
+co_dose <- co_dose / (2 * sd(co_dose))
+model <- 'Alpha-CRM'
+
+parameters <- switch(
+  model,
+  "IPCRM" = list(cutoff = 0.96, d = dose, model_file = 'logit.bug'),
+  "IPCRM-CO" = list(cutoff = 0.73, d = co_dose, model_file = 'logit_CO.bug'),
+  "Alpha-CRM" = list(cutoff = 0.95, 
+                     s_grid = c(0.12, 0.20, 0.30, 0.40, 0.50),
+                     d_grid = c(15, 20, 30, 35, 45)),
+  "POCRM" = list(cutoff = 0.95, 
+                 skeleton = c(0.12, 0.16, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50),
+                 ordering = ipde_pocrm_orderings(d_grid)$orderings,
+                 model_file = 'crm.bug'),
+  stop("Unknown model")
+)
+
+Kmax = 2
+window = 28
+args <- commandArgs(trailingOnly = TRUE)
+if (length(args) < 1) stop("Please provide the job index as the first argument.")
+job_i <- as.integer(args[1])
+cat('Seed', job_i, '\n')
+alpha_list <- c(0, 0.3, 0.6, 0.9)
+for(j in 1){
+  for(k in 1){
+    for (alpha in alpha_list) {
+      cat('Alpha', alpha, '\n')
+      for (sc in 0:5) {
+        cat('sce', sc, '\n')
+        sce <- ipde_probabilities(c = sc, alpha)
+        
+        res <- simulate_IPCRM_trial(
+          PI = sce$p_base,
+          PI_ipde = sce$p_ipde,
+          J = length(ske1),
+          COHORTSIZE = 3,
+          ncohort = 10,
+          Kmax = Kmax,
+          TARGET = 0.30,
+          window = window,
+          arrival_rate = 1/14,
+          seed = job_i,
+          verbose = FALSE,
+          model = model,
+          parameters = parameters,
+          escalation_rule_ipde = j,
+          escalation_rule_new = k
+        )
+        
+        foldername <- paste0(
+          "results/3-27-2026/Alpha-IPCRM/",
+          "res", sc + 1,
+          "-alpha-", alpha,
+          "-Kmax-", Kmax,
+          "-Window-", window,
+          "-model-", model,
+          "-escalation_rule_ipde-", j,
+          "-escalation_rule_new-", k
+        )
+        
+        if (!dir.exists(foldername)) {
+          dir.create(foldername, recursive = TRUE)
+        }
+        
+        saveRDS(res, paste0(foldername, "/trial-", job_i))
+      }
+    }
+  }
+}
